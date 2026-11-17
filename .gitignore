@@ -1,0 +1,13 @@
+# Ignore everything at the repository root...
+/*
+
+# ...except these two folders (and their contents).
+!/BH799_E2M2_FlashTool/
+!/BH799_E2M2_FlashTool_Win/
+
+# Keep the ignore rules themselves under version control.
+!.gitignore
+
+**/backup/
+**/__pycache__/
+BH799_E2M2_FlashTool/*.bin
