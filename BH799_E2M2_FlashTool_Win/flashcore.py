@@ -46,6 +46,9 @@ SN_OFF, SN_LEN = 0x10C, 20
 MODEL_OFF, MODEL_LEN = 0x120, 40
 MASK_OFF = 0x148              # 只 1 字节 (后 3 字节为 0); 0x144 不是字段
 VENDOR_OVERRIDE_OFF, VENDOR_OVERRIDE_LEN = 0x154, 8
+# 0x154 是 MID 段覆盖串: 固件不会自动补分隔符 '-', 写入值必须自带;
+# 0x15C 是紧随其后被使用的字段, 写入绝不能超过 8B 越界覆盖它.
+# 因此 UI 输入上限 7B, 末尾补 '-' 后正好占满 0x154 的 8B.
 TOOL_RECORD_OFF = 0x3E0       # 产线工具记录, 固件不读
 
 # 客户参数区窗口 (build_image 覆盖用; 保留 base 的 DWORD0/段表/dw31/产线记录)
@@ -193,7 +196,7 @@ RUNTIME_SEGMENT_NOTE = ("MID/PNM/FWVER/CAP 为示意值, 实际由板上 eMMC �
 def assemble_model_preview(mask: int, vendor_override: str = ""):
     """按位 7->0 拼装示意串. 返回 (preview_str, length, ok).
 
-    0x154 覆盖串用真实值; 运行时段用 RUNTIME_EXAMPLE 示意值.
+    0x154 覆盖串(写入值, 含末尾 '-')用真实值; 运行时段用 RUNTIME_EXAMPLE 示意值.
     总长 >40 时固件会整体放弃拼装 (型号保持空).
     """
     parts = []
@@ -203,7 +206,9 @@ def assemble_model_preview(mask: int, vendor_override: str = ""):
         if bit == 0x80:
             parts.append("BAYHUB ")
         elif bit == 0x20:
-            parts.append((vendor_override + "-") if vendor_override
+            # 0x154 覆盖整个 MID 段且固件不自动补 '-': 写入值已自带,
+            # 这里直接使用, 不再追加 (否则出现 '--').
+            parts.append(vendor_override if vendor_override
                          else RUNTIME_EXAMPLE[0x20])
         elif bit in RUNTIME_EXAMPLE:
             parts.append(RUNTIME_EXAMPLE[bit])

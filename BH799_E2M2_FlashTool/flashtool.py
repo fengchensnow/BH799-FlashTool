@@ -81,7 +81,7 @@ RULE_MASK = """\
   位     名称    段内容                  来源
   0x80  VEN     "BAYHUB " (7B)          固定 rodata
   0x40  OEM     OEM 串 (≤8B)             头字段; 0xBC 未启用此位, 不参与拼装
-  0x20  MID     eMMC 厂商名 + '-'        运行时 CID[0]; 0x154 非空时覆盖厂商名 [运行时]
+  0x20  MID     eMMC 厂商名 + '-'        运行时 CID[0]; 0x154 覆盖 MID 段(写入值须自带 '-') [运行时]
   0x10  PNM     6B 产品名 + '-'          运行时 CID[3..8] [运行时]
   0x08  FWVER   '0x' + 4hex + '-'       运行时版本值 [运行时]
   0x04  CAP     数字 + 'GB '             运行时容量 [运行时]
@@ -89,7 +89,7 @@ RULE_MASK = """\
   0x01  DISK    "Disk"                   固定 rodata
   0x154 厂商名覆盖串: 固件能按 eMMC CID[0] MID 自动识别以下 %d 个厂商, 命中时留空即可:
     %s
-  这些厂商之外的 eMMC 需自定义 0x154 覆盖串 (≤8B).
+  这些厂商之外的 eMMC 需自定义 0x154 覆盖串 (输入 ≤7B, 程序在末尾补 '-' 后共 8B).
   MID/PNM/FWVER/CAP 由板上 eMMC 决定, 镜像内无法预览 (示意用真机抓包值).
   真机例 (0xBC): BAYHUB Samsung-CKTM4R-0x0012-64GB
 """ % (len(fc.AUTO_VENDOR_NAMES), _VENDOR_LIST)
@@ -515,6 +515,7 @@ def build_image(base_name: str, header: bytes | None = None,
         out[fc.MODEL_OFF:fc.MODEL_OFF + fc.MODEL_LEN] = b"\x00" * fc.MODEL_LEN
         out[fc.MASK_OFF] = (fc.DEFAULT_MASK_XM if ov.mask is None else ov.mask) & 0xFF
         if ov.vendor_override is not None:
+            # 严格 8B: 0x15C 是紧随其后在用的字段, 越界会破坏它.
             fc.set_fixed(out, fc.VENDOR_OVERRIDE_OFF, fc.VENDOR_OVERRIDE_LEN,
                          ov.vendor_override, "0x154")
     elif ov.model is not None:
@@ -649,7 +650,7 @@ def dynamic_assembly_ui() -> Overrides:
     """掩码固定 0xBC; 只问 0x154 厂商名覆盖串.
 
     固件能按 eMMC CID[0] MID 自动识别 fc.AUTO_VENDOR_NAMES 里的厂商, 命中时
-    0x154 留空即可; 列表之外的厂商才需自定义覆盖串 (≤8B).
+    0x154 留空即可; 列表之外的厂商才需自定义覆盖串 (输入 ≤7B, 补 '-' 后 8B).
     """
     print("  按BAYHUB 厂商名MID-CID颗粒名PNM-EMMC固件版本FWVER-容量CAP 命名。")
     print("  如需自定义显示可以参考文档自行修改掩码位")
@@ -657,11 +658,14 @@ def dynamic_assembly_ui() -> Overrides:
           % (len(fc.AUTO_VENDOR_NAMES), _VENDOR_LIST))
     print("  命中这些厂商时 0x154 留空即可; 列表外的厂商才需自定义覆盖串.")
     while True:
-        a = input("  0x154 厂商名覆盖串 (≤8B, 回车=留空): ").strip()
-        if len(a.encode("latin-1", "replace")) > fc.VENDOR_OVERRIDE_LEN:
-            print("  超过 8 字节, 请重输.")
+        a = input("  0x154 厂商名覆盖串 (≤7B, 回车=留空): ").strip()
+        if len(a.encode("latin-1", "replace")) > fc.VENDOR_OVERRIDE_LEN - 1:
+            print("  超过 7 字节 (加上自动补的 '-' 共 8B), 请重输.")
             continue
         break
+    if a:
+        # 固件不会自动补 '-'; 末尾补上后正好占满 0x154 的 8B, 不越界到 0x15C.
+        a += "-"
     preview, ln, ok = fc.assemble_model_preview(FIXED_DYNAMIC_MASK, a)
     print("  预览: %r   长度 %d/40  %s"
           % (preview, ln, "OK" if ok else "⚠ 超 40 字节, 固件将整体放弃拼装(型号保持空)"))
@@ -1051,8 +1055,8 @@ def selftest() -> int:
        and "Kingston" in fc.AUTO_VENDOR_NAMES and "Samsung" in fc.AUTO_VENDOR_NAMES,
        "固件可自动识别厂商表 13 家")
     ck(all(len(v.encode("latin-1")) <= fc.VENDOR_OVERRIDE_LEN
-           for v in fc.AUTO_VENDOR_NAMES), "13 家厂商名均 ≤8B (可被 0x154 覆盖)")
-    pv2, ln2, ok2 = fc.assemble_model_preview(0xBC, "ACME")
+           for v in fc.AUTO_VENDOR_NAMES), "13 家厂商名均 ≤8B (固件自动识别, 无需覆盖)")
+    pv2, ln2, ok2 = fc.assemble_model_preview(0xBC, "ACME-")
     ck("ACME-" in pv2 and ok2, "0x154 覆盖串在 MID 段预览中生效")
 
     # 4. 字序往返 (用 12345/header_raw.bin 若存在, 否则用底包头 swap)
@@ -1087,7 +1091,7 @@ def selftest() -> int:
         b = fc.FwImage(BASE_FILES[base].read_bytes(), base)
         # 自定义模式 (header=None): 只覆盖用户输入, 其余沿用底包
         d = build_image(base, None, Overrides(is_dynamic=True, mask=0xA4,
-                                              vendor_override="VEND",
+                                              vendor_override="VEND-",
                                               sn="SN123", smart_block=3, uart_led=0x40))
         i = fc.FwImage(d, "<t>")
         ck(not i.errors(), "build_image(%s, None) validate" % base)
@@ -1095,7 +1099,7 @@ def selftest() -> int:
            "自定义模式保留底包 0x38/dw31/长度")
         ck(i.serial == "SN123" and i.is_dynamic_model and i.model_mask == 0xA4,
            "自定义模式 SN/动态/mask 生效")
-        ck(i.vendor_override == "VEND" and (d[fc.SMART_BLK_OFF] & 1) == 1
+        ck(i.vendor_override == "VEND-" and (d[fc.SMART_BLK_OFF] & 1) == 1
            and (d[fc.GPIO_MODE_OFF] >> 6) == 1,
            "自定义模式 0x154/0xCD/0x105 生效")
         # 保持/导入模式 (header 覆盖)
@@ -1123,9 +1127,9 @@ def selftest() -> int:
     # 9. 菜单4 动态拼装: 固定掩码 0xBC + 0x154 厂商名覆盖串
     d3 = build_image("xm", None, Overrides(is_dynamic=True,
                                            mask=FIXED_DYNAMIC_MASK,
-                                           vendor_override="ACME"))
+                                           vendor_override="ACME-"))
     i3 = fc.FwImage(d3, "<d3>")
-    ck(d3[fc.MASK_OFF] == 0xBC and i3.is_dynamic_model and i3.vendor_override == "ACME",
+    ck(d3[fc.MASK_OFF] == 0xBC and i3.is_dynamic_model and i3.vendor_override == "ACME-",
        "固定 0xBC + 0x154 覆盖串写入生效")
     try:
         build_image("xm", None, Overrides(is_dynamic=True,
@@ -1133,6 +1137,21 @@ def selftest() -> int:
         ck(False, "0x154>8B 应抛错")
     except fc.ImageError:
         ck(True, "0x154>8B 抛错")
+
+    # 自定义覆盖串: 7B + 末尾 '-' 正好 8B (0x15C 在用).
+    # UI 输入循环是薄封装; mock input 在 Nuitka 编译后不可靠, 这里只测纯逻辑.
+    _pv, _ln, _ok = fc.assemble_model_preview(FIXED_DYNAMIC_MASK, "ACME-")
+    ck("ACME-CKTM4R" in _pv and "ACME--" not in _pv,
+       "型号串里覆盖串后恰好一个 '-'")
+    _d = build_image("xm", None, Overrides(is_dynamic=True, vendor_override="ACME-"))
+    ck(fc.FwImage(_d, "<t>").vendor_override == "ACME-", "0x154 写入生效")
+    _val7 = "1234567-"
+    ck(len(_val7.encode("latin-1")) == 8, "0x154 输入上限 7B, 补 '-' 后正好 8B")
+    _d7 = build_image("xm", None, Overrides(is_dynamic=True, vendor_override=_val7))
+    _base = build_image("xm", None, Overrides(is_dynamic=True))
+    ck(_d7[fc.VENDOR_OVERRIDE_OFF:fc.VENDOR_OVERRIDE_OFF + 8] == b"1234567-"
+       and _d7[fc.VENDOR_OVERRIDE_OFF + 8] == _base[fc.VENDOR_OVERRIDE_OFF + 8],
+       "写入严格 8B, 0x15C 未被覆盖")
 
     print("\n=== 结果: %d 项失败 ===" % len(failures))
     for f in failures:

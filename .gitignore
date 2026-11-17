@@ -11,3 +11,4 @@
 **/backup/
 **/__pycache__/
 BH799_E2M2_FlashTool/*.bin
+BH799_E2M2_FlashTool/dist/

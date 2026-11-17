@@ -82,6 +82,11 @@ IOCTL_SCSI_MINIPORT = CTL_CODE(
     FILE_READ_ACCESS | FILE_WRITE_ACCESS)                                     # 0x0004D008
 IOCTL_DISK_GET_LENGTH_INFO = CTL_CODE(
     FILE_DEVICE_DISK, 0x0017, METHOD_BUFFERED, FILE_READ_ACCESS)             # 0x0007405C
+# GET_LENGTH_INFO 含 FILE_READ_ACCESS, 用 dwDesiredAccess=0 的枚举句柄会被
+# I/O 管理器拒绝; 下面这个 IOCTL 是 FILE_ANY_ACCESS, 作为容量查询的 fallback.
+IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = CTL_CODE(
+    FILE_DEVICE_DISK, 0x0028, METHOD_BUFFERED, FILE_ANY_ACCESS)             # 0x000700A0
+DISK_GEOMETRY_LEN = 24          # DISK_GEOMETRY 大小; DISK_GEOMETRY_EX.DiskSize 紧随其后
 
 # STORAGE_PROPERTY_QUERY / STORAGE_DEVICE_DESCRIPTOR
 STORAGE_PROPERTY_ID_DeviceProperty = 0
@@ -176,6 +181,7 @@ def describe_layout():
         "SRB_IO_CONTROL": ctypes.sizeof(SRB_IO_CONTROL),
         "SPC_HEADER_LEN": SPC_HEADER_LEN,
         "SPC_DATA_OFFSET": SPC_DATA_OFFSET,
+        "DISK_GEOMETRY_LEN": DISK_GEOMETRY_LEN,
     }
 
 
@@ -221,15 +227,20 @@ def is_admin() -> bool:
     return bool(_shell32.IsUserAnAdmin())
 
 
-def _open_handle(path: str, query_only: bool = False):
+def _open_handle(path: str, query_only: bool = False, read_access: bool = False):
     """打开 \\\\.\\PhysicalDriveN; 返回句柄或 None.
 
-    query_only=True 时 dwDesiredAccess=0 —— 仅做 IOCTL_STORAGE_QUERY_PROPERTY /
-    GET_LENGTH_INFO 这类查询, 普通用户权限即可 (枚举不需要管理员).
-    实际发命令 (SCSI_PASS_THROUGH_DIRECT / PROTOCOL_COMMAND 的 CTL_CODE 含
-    FILE_READ_ACCESS|FILE_WRITE_ACCESS) 必须 GENERIC_READ|GENERIC_WRITE, 需管理员.
+    query_only=True   -> dwDesiredAccess=0: FILE_ANY_ACCESS 查询, 普通用户可枚举.
+    read_access=True -> dwDesiredAccess=GENERIC_READ: CTL_CODE 含 FILE_READ_ACCESS
+                          的 IOCTL 需要此权限 (如 IOCTL_DISK_GET_LENGTH_INFO).
+    默认              -> GENERIC_READ|GENERIC_WRITE: 实际发命令, 需管理员.
     """
-    access = 0 if query_only else (GENERIC_READ | GENERIC_WRITE)
+    if query_only:
+        access = 0
+    elif read_access:
+        access = GENERIC_READ
+    else:
+        access = GENERIC_READ | GENERIC_WRITE
     h = _k32.CreateFileW(
         path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
         OPEN_EXISTING, 0, None)
@@ -261,7 +272,7 @@ def _ioctl(h, code: int, in_bytes: bytes, out_len: int) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# 设备枚举: IOCTL_STORAGE_QUERY_PROPERTY + IOCTL_DISK_GET_LENGTH_INFO
+# 设备枚举: IOCTL_STORAGE_QUERY_PROPERTY + 容量 (GET_LENGTH_INFO / GEOMETRY_EX)
 # --------------------------------------------------------------------------
 
 
@@ -291,8 +302,42 @@ def _query_descriptor(h):
 
 
 def _disk_length(h) -> int:
-    raw = _ioctl(h, IOCTL_DISK_GET_LENGTH_INFO, b"", 8)
-    return struct.unpack_from("<Q", raw, 0)[0]
+    """容量字节数: GET_LENGTH_INFO -> GET_DRIVE_GEOMETRY_EX(DiskSize@24).
+
+    任一 IOCTL 失败或返回 0 都继续尝试下一个; 全部失败抛 NvmeError,
+    由 list_disks 决定提权重试 / 打印诊断, 绝不再静默当成 0 容量.
+    """
+    errs = []
+    for code, out_len, off in (
+            (IOCTL_DISK_GET_LENGTH_INFO, 8, 0),
+            (IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, 256, DISK_GEOMETRY_LEN)):
+        try:
+            raw = _ioctl(h, code, b"", out_len)
+            n = struct.unpack_from("<Q", raw, off)[0]
+            if n:
+                return n
+            errs.append("0x%08X 返回 0" % code)
+        except fc.NvmeError as e:
+            errs.append("0x%08X: %s" % (code, e))
+    raise fc.NvmeError("容量查询失败 (%s)" % "; ".join(errs))
+
+
+def _query_capacity(path: str, h) -> tuple[int, str | None]:
+    """容量查询: 先枚举句柄(access=0), 失败再用 GENERIC_READ 句柄重试."""
+    err1 = None
+    try:
+        return _disk_length(h), None
+    except fc.NvmeError as e:
+        err1 = str(e)
+    h2 = _open_handle(path, read_access=True)
+    if not h2:
+        return 0, "%s; GENERIC_READ 句柄打开失败" % err1
+    try:
+        return _disk_length(h2), None
+    except fc.NvmeError as e:
+        return 0, "%s; GENERIC_READ 重试: %s" % (err1, e)
+    finally:
+        _close_handle(h2)
 
 
 def list_disks(max_index: int = 32):
@@ -314,17 +359,17 @@ def list_disks(max_index: int = 32):
                 bus, vendor, product, serial, rev = _query_descriptor(h)
             except fc.NvmeError:
                 continue
-            try:
-                size = _disk_length(h)
-            except fc.NvmeError:
-                size = 0
+            size, size_err = _query_capacity(path, h)
         finally:
             _close_handle(h)
+        if size_err:
+            print("  [容量] %s 读取失败: %s" % (path, size_err))
         disks.append({
             "path": path,
             "name": "PhysicalDrive%d" % n,
             "index": n,
             "size_bytes": size,
+            "size_error": size_err,
             "vendor": vendor,
             "model": product,
             "serial": serial or None,
