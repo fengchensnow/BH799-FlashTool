@@ -30,6 +30,7 @@ from __future__ import annotations
 import re
 import struct
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -78,7 +79,6 @@ RULE_IMAGE = """\
   * DWORD0  b0^b1^b2^b3 == 0xFF (奇偶), 低 24 位 = body 长度
   * DWORD31 @0x7C = 0x400..0x100000 大端 u32 XOR (不含 80B 编程器尾)
   客户参数区 0x000-0x3FF 不在校验范围内 -> 改 SN/型号/mask/0xCD/0x105 无需重算校验.
-  XM 底包多 80B '-Configuration-' 编程器尾, 刷写/XOR 前裁掉 (trimmed).
 """
 
 RULE_MASK = """\
@@ -98,29 +98,26 @@ RULE_MASK = """\
   这些厂商之外的 eMMC 需自定义 0x154 覆盖串 (≤8B).
   MID/PNM/FWVER/CAP 由板上 eMMC 决定, 镜像内无法预览 (示意用真机抓包值).
   真机例 (0xBC): BAYHUB Samsung-CKTM4R-0x0012-64GB
-  位名以反汇编为准 (doc/model_name_dynamic_assembly.md §5/§6); 旧资料的 cap/fwver/pnm/mid 标反了.
 """ % (len(fc.AUTO_VENDOR_NAMES), _VENDOR_LIST)
 
 RULE_GPIO = """\
-[UART/LED] 0x105 bits7:6: 0x40=UART 115200 (GD 客户板), 0x80=LED 忙闲闪烁 (XM 工程板).
-  0x107 bit7 -> 输出电平 0x10(0) / 0x30(1). 注意: 静态成立 ≠ 真机可用 ——
-  GPIO0 若物理接的是 LED, 切 UART 不会有串口输出; FW Download/Commit 期间引脚切
-  MODE_SPI, 串口日志必然中断. 该设置无需重算校验 (doc/gpio0_uart_led_mode.md).
+[UART/LED] 0x105 bits7:6: 0x40=UART 115200 (原始固件), 0x80=LED 忙闲闪烁 (修复SMART固件).
+  0x107 bit7 -> 输出电平 0x10(0) / 0x30(1). 
+  GPIO0 若物理接的是 LED, 切 UART 不会有串口输出; FW Download/Commit 期间串口日志会中断.
 """
 
 RULE_SMART = """\
 [SMART] 记录是 eMMC 保留区一个 512B 块 (不在 SPI Flash, 跨刷固件保留, 无 magic/CRC).
   0xCD bit0 选块: 0=块1(BLOCK2), 1=块3(BLOCK4), 被 12 处代码读取.
   GD 把 namespace 配置结构放在块1, XM 当 SMART 记录读 -> "写入量≈容量/HostWrite 高32位异常".
-  [同源规则] 清除用的中间固件必须与最终固件 0xCD 一致, 否则写地址与读地址对不上.
-  三步: 刷一次中间固件 -> 完整断电再上电(512B 全0合法记录在此步写入) -> 断电刷回同源最终固件.
-  在线 FW Commit 会写回 SMART 结构体, 最终固件建议用编程器整片刷.
-  blk3_bridge.bin (0xCD=1) ≡ 根目录 blk4_bridge.bin, "blk3=块3=BLOCK4" 同一东西两种叫法.
+  [同源规则] 清除用的中间固件必须与最终固件 0xCD 一致, 否则可能导致SMART异常.
+!!!三步: 刷一次blk1中间固件 -> 完整断电再上电(512B 全0合法记录在此步写入) -> 断电刷回同源最终固件.
+!!!或者直接刷入XM固件, SMART选择blk3槽位. 中间固件也可用于清空SMART
 """
 
 RULE_SAFETY = """\
-[安全] 静态校验通过 ≠ 真机可用. 刷写中途失败/掉电会清 SPI DWORD0, 只能拆板用编程器恢复.
-  本工具不自动串联 刷写+校验 循环, 不现场生成固件补丁 (4 个 FIRMWARE/*.bin 仅作数据文件).
+[安全] 刷机有风险. 刷入前请备份设备信息. 刷写中途失败/掉电会变砖, 只能用编程器恢复.
+  本工具不现场生成固件补丁,4个 FIRMWARE/*.bin 仅作数据文件.
 """
 
 
@@ -145,7 +142,7 @@ class Disk:
     usb_driver: str = ""
     devpath: str = ""
     is_char_nvme: bool = False
-    decision: str = ""            # jmicron / nvme / nvme-needs-probe
+    decision: str = ""            # jmicron / nvme / reject
 
 
 @dataclass
@@ -200,8 +197,17 @@ def list_disks() -> list[Disk]:
 
 
 def decide_transport(d: Disk):
-    """只按总线选传输通道; 不再排除设备, 选盘阶段不拦截."""
-    d.decision = "nvme" if d.is_char_nvme else "jmicron"
+    """按 TRAN 直接选通道: usb→JMicron 透传, nvme→NVMe 直连, 其余拒绝.
+
+    Win 版 tran 为 BusType 名 (Usb/Nvme/Sata), lower() 后取值与本表一致.
+    """
+    t = (d.tran or "").strip().lower()
+    if t == "usb":
+        d.decision = "jmicron"
+    elif t == "nvme":
+        d.decision = "nvme"
+    else:
+        d.decision = "reject"
 
 
 def _human(n: int) -> str:
@@ -212,18 +218,38 @@ def _human(n: int) -> str:
     return "%d" % n
 
 
+def _dw(s) -> int:
+    """终端显示宽度: 中日韩全角字符按 2 列, 其余按 1 列."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+               for c in str(s))
+
+
+def _pad(s, width: int) -> str:
+    """按显示宽度左对齐补齐, 替代 %-Ns, 避免中文表头/值错位."""
+    s = str(s)
+    return s + " " * max(0, width - _dw(s))
+
+
+def _table_row(cells, widths) -> str:
+    """列间 1 空格分隔; 最后一列不补齐."""
+    return ("  " + " ".join(_pad(c, w) for c, w in zip(cells[:-1], widths))
+            + " " + str(cells[-1]))
+
+
 def print_disk_table(disks: list[Disk]):
     print("\n=== 可选择的设备 (PhysicalDriveN) ===")
-    print("  %-3s %-24s %-9s %-24s %-7s %-6s %s"
-          % ("#", "路径", "容量", "型号 / 厂商", "总线", "硬盘盒", "决策"))
+    widths = (3, 24, 9, 24, 7, 8)   # 各列显示宽度; 最后一列(决策)不补齐
+    print(_table_row(("#", "路径", "容量", "厂商 / 型号", "总线",
+                      "硬盘盒", "决策"), widths))
     for i, d in enumerate(disks, 1):
         box = "是" if d.is_usb else "否"
-        dec = {"jmicron": "JMicron SCSI 透传", "nvme": "NVMe 直通"}.get(d.decision, d.decision)
-        print("  %-3d %-24s %-9s %-24s %-7s %-6s %s"
-              % (i, d.path, _human(d.size_bytes),
-                 (d.model[:12] + "/" + d.vendor[:10]).strip() or "-",
-                 d.tran or "-", box, dec))
+        dec = {"jmicron": "JMicron SCSI 透传", "nvme": "NVMe 直通",
+               "reject": "拒绝 (sata/未知总线)"}.get(d.decision, d.decision)
+        print(_table_row((i, d.path, _human(d.size_bytes),
+                          ("/".join(x for x in (d.vendor[:10], d.model[:12]) if x) or "-"),
+                          d.tran or "-", box, dec), widths))
     print("  提示: Windows 版用 BusType(总线) 标注硬盘盒; USB VID/PID 需 SetupAPI, 本版不取.")
+    print("  提示: 决策按 TRAN: usb→JMicron 透传 / nvme→NVMe 直连 / sata·其它→拒绝.")
     print("  提示: 请仔细核对所选设备路径/型号后再刷写, 刷错设备后果自负.")
 
 
@@ -263,9 +289,12 @@ def pick_disk(state: AppState, disks: list[Disk]) -> bool:
         if d is None:
             print("无效选择, 重试.")
             continue
+        if d.decision == "reject":
+            print("该设备不支持: TRAN=%r (sata/未知总线, 无透传通道); 请改选." % (d.tran or "-"))
+            continue
         state.disk = d
         state.offline = False
-        state.transport = "nvme" if d.is_char_nvme else "jmicron"
+        state.transport = "nvme" if d.decision == "nvme" else "jmicron"
         state.probe_ok = False
         state.snapshot = None
         return True
@@ -498,6 +527,9 @@ def confirm(prompt: str, token: str | None = None) -> bool:
 def _require_device(state: AppState, need_admin: bool = True):
     if state.disk is None:
         raise RuntimeError("未选择设备 (离线模式); 按 'r' 重新选择.")
+    if state.disk.decision == "reject":
+        raise RuntimeError("目标设备被拒绝: TRAN=%r (sata/未知总线, 无透传通道)"
+                            % (state.disk.tran or "-"))
     if need_admin:
         if not state.is_admin:
             raise RuntimeError("该操作需要管理员权限 (请以管理员身份运行 python flashtool.py)")
@@ -537,8 +569,8 @@ def dynamic_assembly_ui() -> Overrides:
     固件能按 eMMC CID[0] MID 自动识别 fc.AUTO_VENDOR_NAMES 里的厂商, 命中时
     0x154 留空即可; 列表之外的厂商才需自定义覆盖串 (≤8B).
     """
-    print("\n  固定 mask=0x%02X [%s] (0x120 清空, 运行时按位拼装)"
-          % (FIXED_DYNAMIC_MASK, fc.mask_str(FIXED_DYNAMIC_MASK)))
+    print("  按BAYHUB 厂商名MID-CID颗粒名PNM-EMMC固件版本FWVER-容量CAP 命名。")
+    print("  如需自定义显示可以参考文档自行修改掩码位")
     print("  固件可自动识别以下 %d 家 eMMC 厂商: %s"
           % (len(fc.AUTO_VENDOR_NAMES), _VENDOR_LIST))
     print("  命中这些厂商时 0x154 留空即可; 列表外的厂商才需自定义覆盖串.")
@@ -571,7 +603,7 @@ def _choose(prompt: str, options: dict[str, str], default: str | None = None):
 
 
 def choose_smart_block() -> int:
-    a = _choose("选择 SMART 槽位 (0xCD bit0):",
+    a = _choose("选择 SMART 槽位 (0xCD bit0).若未刷中间固件,请选择blk3:",
                 {"1": "blk1 / 块1 BLOCK2 (0xCD=0)",
                  "2": "blk3 / 块3 BLOCK4 (0xCD=1)"}, "1")
     return 1 if a == "1" else 3
@@ -673,20 +705,20 @@ def menu_4(state: AppState):
     _require_device(state)
     print("\n=== 在线刷入向导 ===")
     # 1) 底包
-    a = _choose("1) 选择底包:", {"1": "XM25QH80B (工程版)", "2": "GD25Q80 (客户版)"}, "1")
+    a = _choose("1) 选择底包:", {"1": "XM25QH80B (修复SMART固件)", "2": "GD25Q80 (原始固件)"}, "1")
     base = "xm" if a == "1" else "gd"
     ov = Overrides()
     header: bytes | None = None
     # 2) 信息来源 (三选一)
     src = _choose("2) 信息来源:",
-                  {"1": "保持原盘信息 (在线设备 1KB 头)",
-                   "2": "导入设备信息 (1KB 头文件, 先列出内容)",
+                  {"1": "保持当前信息",
+                   "2": "导入备份信息",
                    "3": "自定义信息"}, "1")
     if src == "1":
         if state.header_1kb is None:
             raise RuntimeError("没有在线设备 1KB 头; 请以管理员身份运行并选设备.")
         header = state.header_1kb
-        print("  将用在线设备头覆盖 0x20-0x7C 与 0x80-0x3E0 (保留底包长度/段表/校验).")
+        # print("  将用当前设备头覆盖 0x20-0x7C 与 0x80-0x3E0 (保留底包长度/段表/校验).")
     elif src == "2":
         hdrs = list_header_files()
         if hdrs:
@@ -710,7 +742,6 @@ def menu_4(state: AppState):
         if not confirm("按此头覆盖客户参数区?"):
             return
     else:
-        print("  0x120 首 dword≠0 -> 原样使用 40B 型号; 全 0 -> 运行时动态拼装.")
         kind = _choose("   自定义型号方式:",
                        {"1": "自定义型号 (静态, ≤40B)", "2": "采用动态拼装"}, "2")
         if kind == "1":
@@ -732,12 +763,8 @@ def menu_4(state: AppState):
             print("   [提示] 未读到当前硬盘 SN (需管理员 + 在线设备); 回车则沿用底包 SN.")
         sn = input("   最后: 自定义 SN (≤20B, 回车=保持当前硬盘SN): ").strip()
         ov.sn = sn if sn else (cur_sn or None)
-        print("  其余字段全部沿用所选底包 (0x38 等配置区不从在线设备继承).")
     # 3) SMART 槽位
     ov.smart_block = choose_smart_block()
-    if ov.smart_block == 3:
-        print("  说明: 只是把 0xCD 00→01, 无需重算校验; 等价于切到空的块3, "
-              "不清历史. 要清历史请用菜单3的中间固件 (SMART_BRIDGE_FIRMWARE.md §5).")
     # 4) uart/led
     ov.uart_led = choose_uart_led()
     # 5) 刷入 / 导出

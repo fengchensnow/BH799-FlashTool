@@ -508,7 +508,7 @@ class FwImage:
         print("  MN  @0x120    : %r%s" % (self.model, "  (空 -> 运行时动态拼装)"
                                          if self.is_dynamic_model else "  (静态)"))
         print("  型号掩码 0x148: 0x%02X  [%s]" % (self.model_mask, mask_str(self.model_mask)))
-        print("  自定义厂商名 : %r" % self.vendor_override)
+        print("  自定义厂商名 @0x154: %r" % self.vendor_override)
         g = gpio_mode_info(self.data[GPIO_MODE_OFF], self.data[GPIO_LEVEL_OFF])
         print("  GPIO 0x105    : 0x%02X -> %s (0x107 bit7 -> 0x%02X)"
               % (self.data[GPIO_MODE_OFF], g["mode_name"], g["level_byte"]))
