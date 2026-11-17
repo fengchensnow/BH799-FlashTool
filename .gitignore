@@ -16,3 +16,5 @@
 **/__pycache__/
 BH799_E2M2_FlashTool/*.bin
 BH799_E2M2_FlashTool/dist/
+BH799_E2M2_FlashTool_Win/dist/
+BH799_E2M2_FlashTool_Win/*.bin
