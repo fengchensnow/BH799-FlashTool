@@ -5,6 +5,10 @@
 !/BH799_E2M2_FlashTool/
 !/BH799_E2M2_FlashTool_Win/
 
+# Keep the top-level README and the docs under version control.
+!/README.md
+!/doc/
+
 # Keep the ignore rules themselves under version control.
 !.gitignore
 
