@@ -22,7 +22,6 @@ import glob
 import json
 import os
 import re
-import stat
 import struct
 import subprocess
 import sys
@@ -140,9 +139,7 @@ class Disk:
     usb_driver: str = ""
     devpath: str = ""
     is_char_nvme: bool = False
-    decision: str = ""            # jmicron / nvme / nvme-needs-probe / unsupported
-    is_system: bool = False
-    notes: str = ""
+    decision: str = ""            # jmicron / nvme / nvme-needs-probe
 
 
 @dataclass
@@ -293,37 +290,18 @@ def list_disks() -> list[Disk]:
     # NVMe 字符设备 (控制器). nvme0n1 之类块命名空间已在上面列为 disk.
     for pth in sorted(glob.glob("/dev/nvme[0-9]")):
         disks.append(Disk(path=pth, name=os.path.basename(pth),
-                           is_char_nvme=True, decision="nvme-needs-probe",
-                           notes="NVMe 控制器 (字符设备)"))
+                           is_char_nvme=True, decision="nvme-needs-probe"))
     for d in disks:
         enrich_usb(d)
     return disks
 
 
-def _matches_jmicron(d: Disk) -> bool:
-    return ((d.usb_vid == "152d" and d.usb_pid == "f583")
-            or "BAYHUB" in d.vendor.upper()
-            or "BAYHUB" in d.model.upper()
-            or d.usb_vid == "152d"
-            or (d.usb_driver == "uas" and d.is_usb))
-
-
 def decide_transport(d: Disk):
+    """只选传输通道; 不再排除设备, 选盘阶段不拦截."""
     if d.is_char_nvme:
         d.decision = "nvme-needs-probe"     # 需 root 只读 Identify 后才定
-        return
-    try:
-        st = os.stat(d.path)
-    except OSError as e:
-        d.decision, d.is_system, d.notes = "unsupported", True, "无法 stat: %s" % e
-        return
-    if stat.S_ISBLK(st.st_mode) and not d.name.startswith("nvme"):
-        if d.is_usb and _matches_jmicron(d):
-            d.decision = "jmicron"
-        else:
-            d.decision, d.is_system, d.notes = "unsupported", True, "非 BH799 USB 硬盘盒"
-        return
-    d.decision, d.is_system, d.notes = "unsupported", True, "块命名空间/系统盘, 无 Admin 通道"
+    else:
+        d.decision = "jmicron"
 
 
 def _human(n: int) -> str:
@@ -343,13 +321,12 @@ def print_disk_table(disks: list[Disk]):
         vidpid = ("%s:%s/%s" % (d.usb_vid or "-", d.usb_pid or "-",
                                 d.usb_driver or "-")) if d.is_usb else "-"
         dec = {"jmicron": "JMicron SG_IO 透传", "nvme": "NVMe 直连",
-               "nvme-needs-probe": "NVMe 控制器(待探测)",
-               "unsupported": "不支持(系统盘)"}.get(d.decision, d.decision)
+               "nvme-needs-probe": "NVMe 控制器(待探测)"}.get(d.decision, d.decision)
         print("  %-3d %-14s %-9s %-22s %-5s %-7s %-13s %s"
               % (i, d.path, _human(d.size_bytes),
                  (d.model[:11] + "/" + d.vendor[:9]).strip() or "-",
                  d.tran or "-", box, vidpid, dec))
-    print("  提示: /dev/nvme0 在本机是三星系统 SSD, 绝不可选作刷写目标; 型号是截断的 INQUIRY 串, 勿精确匹配.")
+    print("  提示: 请仔细核对所选设备路径/型号后再刷写, 刷错设备后果自负; INQUIRY 型号串可能是截断的, 勿精确匹配.")
 
 
 def pick_disk(state: AppState, disks: list[Disk]) -> bool:
@@ -378,9 +355,6 @@ def pick_disk(state: AppState, disks: list[Disk]) -> bool:
         if d is None:
             print("无效选择, 重试.")
             continue
-        if d.decision == "unsupported":
-            print("该设备不支持: %s; 请改选." % d.notes)
-            continue
         state.disk = d
         state.offline = False
         state.transport = "nvme" if d.is_char_nvme else "jmicron"
@@ -394,7 +368,7 @@ def _open_dev(state: AppState):
 
 
 def confirm_passthrough(state: AppState):
-    """root 时只读 Identify + 0xC0 冒烟测试并缓存; 校验 MN 必须是 BH799."""
+    """root 时只读 Identify + 0xC0 冒烟测试并缓存."""
     if state.disk is None:
         return
     if not state.is_root:
@@ -414,17 +388,8 @@ def confirm_passthrough(state: AppState):
     state.header_1kb = snap["header"]
     state.header_raw = snap["header_raw"]
     state.header_mode = snap["header_mode"]
-    # MN 守卫: char nvme 控制器可能是系统 SSD; 非 BH799 一律拒绝
-    if snap["identify"]:
-        idn = fc.IdentifyInfo(snap["identify"])
-        mn = idn.mn.upper()
-        if not ("BAYHUB" in mn or "E2M2" in mn or mn.startswith("E2M")):
-            print("警告: Identify Model=%r 不像 BH799 桥片, 拒绝作为目标." % idn.mn)
-            state.disk.decision, state.disk.is_system = "unsupported", True
-            state.probe_ok = False
-            return
-        if state.disk.is_char_nvme:
-            state.disk.decision = "nvme"
+    if snap["identify"] and state.disk.is_char_nvme:
+        state.disk.decision = "nvme"
     state.probe_ok = bool(snap["identify"])
 
 
@@ -621,8 +586,6 @@ def confirm(prompt: str, token: str | None = None) -> bool:
 def _require_device(state: AppState, root: bool = True):
     if state.disk is None:
         raise RuntimeError("未选择设备 (离线模式); 按 'r' 重新选择.")
-    if state.disk.decision == "unsupported" or state.disk.is_system:
-        raise RuntimeError("目标设备不支持刷写: %s" % (state.disk.notes or "系统盘"))
     if root:
         if not state.is_root:
             raise RuntimeError("该操作需要 root (请用 sudo /usr/bin/python3 flashtool.py 运行)")
@@ -934,6 +897,14 @@ def print_rule_summaries():
     print(RULE_SAFETY)
 
 
+def clear_screen():
+    """清空终端可见输出 (主界面选择选项后调用). 输出被重定向时不动作."""
+    if not sys.stdout.isatty():
+        return
+    sys.stdout.write("\033[2J\033[3J\033[H")
+    sys.stdout.flush()
+
+
 def print_menu(state: AppState):
     dev = ("%s [%s %s]" % (state.disk.path, state.disk.decision, state.transport)
            if state.disk else "离线/未选择")
@@ -944,7 +915,7 @@ def print_menu(state: AppState):
     print("  r) 重新选择设备        0) 退出")
 
 
-def main(argv=None) -> int:
+def _main_loop(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     state = AppState(is_root=(os.geteuid() == 0))
     state.dry_run = "--dry-run" in argv
@@ -975,6 +946,7 @@ def main(argv=None) -> int:
         c = input("选择: ").strip().lower()
         if c in ("0", "q", "quit", "exit"):
             return 0
+        clear_screen()
         if c == "r":
             if not pick_disk(state, disks):
                 return 0
@@ -1145,6 +1117,19 @@ def selftest() -> int:
     for f in failures:
         print("  - %s" % f)
     return 1 if failures else 0
+
+
+def main(argv=None) -> int:
+    """入口: 主界面/向导任意处 Ctrl-C 优雅退出, 不抛 traceback.
+
+    向导函数内部的 KeyboardInterrupt 由主循环单独捕获 -> 只取消当前操作回主菜单;
+    此处兜底主菜单 input、启动选盘等其余位置的中断.
+    """
+    try:
+        return _main_loop(argv)
+    except (KeyboardInterrupt, EOFError):
+        print("\n已退出.")
+        return 130
 
 
 if __name__ == "__main__":

@@ -145,9 +145,7 @@ class Disk:
     usb_driver: str = ""
     devpath: str = ""
     is_char_nvme: bool = False
-    decision: str = ""            # jmicron / nvme / nvme-needs-probe / unsupported
-    is_system: bool = False
-    notes: str = ""
+    decision: str = ""            # jmicron / nvme / nvme-needs-probe
 
 
 @dataclass
@@ -201,23 +199,9 @@ def list_disks() -> list[Disk]:
     return disks
 
 
-def _matches_jmicron(d: Disk) -> bool:
-    """硬盘盒判定: BusType=Usb 即 USB 盒; BAYHUB 子串作额外佐证.
-
-    Windows 纯 DeviceIoControl 拿不到 152d:f583 VID/PID (需 SetupAPI 读硬件 ID),
-    故以总线类型为主判据, 最终仍由 confirm_passthrough 的 Identify MN 守卫把关.
-    """
-    return d.is_usb or "BAYHUB" in (d.vendor + d.model).upper()
-
-
 def decide_transport(d: Disk):
-    """USB 盒 -> JMicron SCSI 透传; NVMe 直连 -> NVMe Pass-Through; 其余拒绝."""
-    if d.is_char_nvme:                          # BusType == Nvme
-        d.decision = "nvme"
-    elif d.is_usb and _matches_jmicron(d):
-        d.decision = "jmicron"
-    else:
-        d.decision, d.is_system, d.notes = "unsupported", True, "非 USB 盒 / 非 NVMe 直连 (可能是系统盘)"
+    """只按总线选传输通道; 不再排除设备, 选盘阶段不拦截."""
+    d.decision = "nvme" if d.is_char_nvme else "jmicron"
 
 
 def _human(n: int) -> str:
@@ -234,15 +218,13 @@ def print_disk_table(disks: list[Disk]):
           % ("#", "路径", "容量", "型号 / 厂商", "总线", "硬盘盒", "决策"))
     for i, d in enumerate(disks, 1):
         box = "是" if d.is_usb else "否"
-        dec = {"jmicron": "JMicron SCSI 透传", "nvme": "NVMe 直通",
-               "unsupported": "不支持(系统盘)"}.get(d.decision, d.decision)
+        dec = {"jmicron": "JMicron SCSI 透传", "nvme": "NVMe 直通"}.get(d.decision, d.decision)
         print("  %-3d %-24s %-9s %-24s %-7s %-6s %s"
               % (i, d.path, _human(d.size_bytes),
                  (d.model[:12] + "/" + d.vendor[:10]).strip() or "-",
                  d.tran or "-", box, dec))
-    print("  提示: Windows 版用 BusType(总线) 判硬盘盒, 最终以 Identify Model 含")
-    print("        BAYHUB/E2M2 的只读守卫确认; USB VID/PID 需 SetupAPI, 本版不取.")
-    print("  提示: 系统盘 (NVMe/ SATA 非 USB) 一律标记不支持, 绝不可选作刷写目标.")
+    print("  提示: Windows 版用 BusType(总线) 标注硬盘盒; USB VID/PID 需 SetupAPI, 本版不取.")
+    print("  提示: 请仔细核对所选设备路径/型号后再刷写, 刷错设备后果自负.")
 
 
 def pick_disk(state: AppState, disks: list[Disk]) -> bool:
@@ -281,9 +263,6 @@ def pick_disk(state: AppState, disks: list[Disk]) -> bool:
         if d is None:
             print("无效选择, 重试.")
             continue
-        if d.decision == "unsupported":
-            print("该设备不支持: %s; 请改选." % d.notes)
-            continue
         state.disk = d
         state.offline = False
         state.transport = "nvme" if d.is_char_nvme else "jmicron"
@@ -297,7 +276,7 @@ def _open_dev(state: AppState):
 
 
 def confirm_passthrough(state: AppState):
-    """管理员时只读 Identify + 0xC0 冒烟测试并缓存; 校验 MN 必须是 BH799.
+    """管理员时只读 Identify + 0xC0 冒烟测试并缓存.
 
     这是 Windows 传输层的【只读验证前置条件】: DeviceIoControl 能否被驱动放行,
     只能在实机由这一步确认。失败则绝不进入任何刷写。
@@ -323,15 +302,6 @@ def confirm_passthrough(state: AppState):
     state.header_1kb = snap["header"]
     state.header_raw = snap["header_raw"]
     state.header_mode = snap["header_mode"]
-    # MN 守卫: 系统 NVMe SSD 也可能是 BusType=Nvme; 非 BH799 一律拒绝
-    if snap["identify"]:
-        idn = fc.IdentifyInfo(snap["identify"])
-        mn = idn.mn.upper()
-        if not ("BAYHUB" in mn or "E2M2" in mn or mn.startswith("E2M")):
-            print("警告: Identify Model=%r 不像 BH799 桥片, 拒绝作为目标." % idn.mn)
-            state.disk.decision, state.disk.is_system = "unsupported", True
-            state.probe_ok = False
-            return
     state.probe_ok = bool(snap["identify"])
 
 
@@ -528,8 +498,6 @@ def confirm(prompt: str, token: str | None = None) -> bool:
 def _require_device(state: AppState, need_admin: bool = True):
     if state.disk is None:
         raise RuntimeError("未选择设备 (离线模式); 按 'r' 重新选择.")
-    if state.disk.decision == "unsupported" or state.disk.is_system:
-        raise RuntimeError("目标设备不支持刷写: %s" % (state.disk.notes or "系统盘"))
     if need_admin:
         if not state.is_admin:
             raise RuntimeError("该操作需要管理员权限 (请以管理员身份运行 python flashtool.py)")
@@ -841,6 +809,14 @@ def print_rule_summaries():
     print(RULE_SAFETY)
 
 
+def clear_screen():
+    """清空终端可见输出 (主界面选择选项后调用). 输出被重定向时不动作."""
+    if not sys.stdout.isatty():
+        return
+    sys.stdout.write("\033[2J\033[3J\033[H")
+    sys.stdout.flush()
+
+
 def print_menu(state: AppState):
     dev = ("%s [%s %s]" % (state.disk.path, state.disk.decision, state.transport)
            if state.disk else "离线/未选择")
@@ -860,7 +836,7 @@ def _console_setup():
             pass
 
 
-def main(argv=None) -> int:
+def _main_loop(argv=None) -> int:
     _console_setup()
     argv = list(sys.argv[1:] if argv is None else argv)
     state = AppState(is_admin=wt.is_admin())
@@ -892,6 +868,7 @@ def main(argv=None) -> int:
         c = input("选择: ").strip().lower()
         if c in ("0", "q", "quit", "exit"):
             return 0
+        clear_screen()
         if c == "r":
             if not pick_disk(state, disks):
                 return 0
@@ -1101,6 +1078,19 @@ def selftest() -> int:
     for f in failures:
         print("  - %s" % f)
     return 1 if failures else 0
+
+
+def main(argv=None) -> int:
+    """入口: 主界面/向导任意处 Ctrl-C 优雅退出, 不抛 traceback.
+
+    向导函数内部的 KeyboardInterrupt 由主循环单独捕获 -> 只取消当前操作回主菜单;
+    此处兜底主菜单 input、启动选盘等其余位置的中断.
+    """
+    try:
+        return _main_loop(argv)
+    except (KeyboardInterrupt, EOFError):
+        print("\n已退出.")
+        return 130
 
 
 if __name__ == "__main__":
