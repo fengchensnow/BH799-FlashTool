@@ -123,8 +123,8 @@ Linux 版另显示 VID:PID 与驱动（`152d:f583/uas`）；Windows 纯 `DeviceI
 | 项 | 功能 |
 |---|---|
 | 1 | 查看设备信息 — Identify、FW 槽位、SMART 健康日志（LID 0x02）、1KB 客户参数区、`0xCD` SMART 块、`0x148` 掩码、`0x105` UART/LED |
-| 2 | 备份设备信息 — 1KB 头存到 `./backup/`（**不是整片固件备份**，固件 body 在线读不到） |
-| 3 | 刷入中间固件 — 选 `blk1` / `blk3`，处理 SMART 数据异常或清 0 |
+| 2 | 备份设备信息 — 1KB 头存到 `./backup/`（可自定义保存名称，回车用默认 `SN_时间戳`；**不是整片固件备份**，固件 body 在线读不到） |
+| 3 | 刷入中间固件 — 选 `blk1` / `blk3`，处理 SMART 数据异常或清 0；刷入时自动保留当前设备 SN/MN（含动态拼装配置） |
 | 4 | 在线刷入向导 — 底包 → 信息来源 → SMART 槽位 → UART/LED → 刷入（默认）或导出 |
 | 5 | 自定义刷入固件 — 列出目录内 `.bin` 或输入路径，校验后刷入 |
 | 6 | 查看固件 / 备份信息 — 打印完整镜像报告或 1KB 头摘要 |
@@ -190,7 +190,7 @@ python -m nuitka --standalone "--include-data-files=FIRMWARE/*=FIRMWARE/" `
 
 ## 安全与状态
 
-- 本工具不现场生成固件补丁；`FIRMWARE/*.bin` 仅作数据文件，改动前请自行核对 SHA-256。
+- 本工具不现场生成固件补丁（不改 body / 不重算校验，仅在客户参数区回写 SN/MN/mask 等字段）；`FIRMWARE/*.bin` 仅作数据文件，改动前请自行核对 SHA-256。
 - 刷写中途失败 / 掉电会变砖，只能用 SPI 编程器恢复；刷前先备份设备信息。
 - Windows NVMe 直连通道已在 BH799 实机验证；直连刷写会自动做 4K 末尾补齐（见上文）。
 - Windows JMS583 通道与 Linux 版一致：FW Download 的 SCSI 数据段按 512B 补齐，

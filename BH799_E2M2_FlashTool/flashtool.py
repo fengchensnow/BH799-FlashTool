@@ -533,6 +533,46 @@ def build_image(base_name: str, header: bytes | None = None,
     return data
 
 
+def preserve_identity(data: bytes, header: bytes | None,
+                      identify: bytes | None) -> tuple[bytes, dict]:
+    """把当前设备的 SN/MN 写回镜像客户参数区 (0x000-0x3FF 不参与校验).
+
+    菜单3 刷中间固件的专用: 中间固件自带 XM 的 SN/型号, 不保留会让后续
+    "保持当前信息" 读到错误的身份. 优先用在线 1KB 头:
+      * 静态型号: 原样复制 0x120 的 40B;
+      * 动态拼装 (0x120 全 0): 复制 0x148..0x15C (掩码/OEM/0x154 覆盖串),
+        板上 eMMC 不变 -> 运行时拼出的型号与当前设备一致.
+    无 1KB 头时退回 Identify 的 SN/MN, 按静态型号写入.
+    返回 (patched, {"sn","mn","dynamic","source"}).
+    """
+    out = bytearray(data)
+    idn = fc.IdentifyInfo(identify) if identify else None
+    sn, mn, dynamic, source = "", "", False, ""
+    if header is not None and len(header) >= fc.HEADER_SIZE:
+        h = bytes(header[:fc.HEADER_SIZE])
+        himg = fc.FwImage(h, "<current header>")
+        sn, mn, dynamic = himg.serial, himg.model, himg.is_dynamic_model
+        source = "在线 1KB 头"
+        out[fc.MODEL_OFF:fc.MODEL_OFF + fc.MODEL_LEN] = \
+            h[fc.MODEL_OFF:fc.MODEL_OFF + fc.MODEL_LEN]
+        if dynamic:
+            out[fc.MASK_OFF:fc.VENDOR_OVERRIDE_OFF + fc.VENDOR_OVERRIDE_LEN] = \
+                h[fc.MASK_OFF:fc.VENDOR_OVERRIDE_OFF + fc.VENDOR_OVERRIDE_LEN]
+            mn = idn.mn if idn and idn.mn else "运行时拼装"
+    elif idn is not None:
+        sn, mn = idn.sn, idn.mn
+        source = "Identify"
+        if mn:
+            fc.set_fixed(out, fc.MODEL_OFF, fc.MODEL_LEN, mn, "MN")
+    if not sn and idn is not None:
+        sn = idn.sn
+    if sn:
+        fc.set_fixed(out, fc.SN_OFF, fc.SN_LEN, sn, "SN")
+    patched = bytes(out)
+    fc.FwImage(patched, "<preserved>").validate()
+    return patched, {"sn": sn, "mn": mn, "dynamic": dynamic, "source": source}
+
+
 def load_header_file(path: Path) -> bytes:
     """读一个 1KB 头文件并归一化 (兼容字反序)."""
     d = Path(path).read_bytes()
@@ -545,6 +585,24 @@ def load_header_file(path: Path) -> bytes:
     return norm
 
 
+def _safe_backup_base(text: str) -> str:
+    """自定义备份名 -> 安全文件名主干; 清洗后为空返回 "" (调用方用默认名)."""
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1F]', "_", text).strip().strip(" .")
+    if name.lower().endswith(".bin"):
+        name = name[:-4].strip(" .")
+    return name[:64]
+
+
+def _unique_backup_base(name: str) -> str:
+    """同名备份已存在时追加 _2/_3..., 不覆盖旧备份."""
+    base, i = name, 2
+    while any((BACKUP_DIR / (base + sfx)).exists()
+              for sfx in ("_header.bin", "_header_raw.bin", "_info.txt")):
+        base = "%s_%d" % (name, i)
+        i += 1
+    return base
+
+
 def save_header_backup(state: AppState):
     if state.header_1kb is None:
         print("没有可用的 1KB 头 (需要 root + 在线设备). 无法备份.")
@@ -553,7 +611,9 @@ def save_header_backup(state: AppState):
     idn = fc.IdentifyInfo(state.identify) if state.identify else None
     sn = (idn.sn if idn else None) or "dev"
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", sn)[:32] or "dev"
-    name = "%s_%s" % (safe, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    auto = "%s_%s" % (safe, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    custom = _safe_backup_base(input("自定义保存名称 (回车=默认 %s): " % auto))
+    name = _unique_backup_base(custom or auto)
     hbin = BACKUP_DIR / (name + "_header.bin")
     hbin.write_bytes(state.header_1kb)
     print("已保存 %s (%d B)" % (hbin, len(state.header_1kb)))
@@ -780,11 +840,18 @@ def menu_3(state: AppState):
     print("  三步流程: 1) 刷一次本中间固件  2) 完整断电 → 再上电一次(512B 全0合法记录在此步写入,"
           " 等几秒)  3) 断电 → 刷回同源最终固件 → 上电, SMART 从 0 正常累加.")
     print("  变砖风险: 中途失败/掉电会清 SPI DWORD0, 只能拆板用编程器恢复.")
-    if not confirm("确认刷入中间固件 %s?" % BRIDGE_FILES[key].name, "Y"):
-        return
     img = fc.FwImage(fc._read(str(BRIDGE_FILES[key])), str(BRIDGE_FILES[key]))
     img.validate()
-    flash_bytes(state, img.trimmed(), label=BRIDGE_FILES[key].name)
+    data, ident = preserve_identity(img.trimmed(), state.header_1kb, state.identify)
+    if ident["sn"] or ident["mn"]:
+        print("  保持当前设备信息 (%s): SN=%r  MN=%r%s"
+              % (ident["source"], ident["sn"], ident["mn"],
+                 " [动态拼装]" if ident["dynamic"] else ""))
+    else:
+        print("  [警告] 未读到当前设备 SN/MN, 将使用中间固件自带值.")
+    if not confirm("确认刷入中间固件 %s?" % BRIDGE_FILES[key].name, "Y"):
+        return
+    flash_bytes(state, data, label=BRIDGE_FILES[key].name)
 
 
 def menu_4(state: AppState):
@@ -1152,6 +1219,37 @@ def selftest() -> int:
     ck(_d7[fc.VENDOR_OVERRIDE_OFF:fc.VENDOR_OVERRIDE_OFF + 8] == b"1234567-"
        and _d7[fc.VENDOR_OVERRIDE_OFF + 8] == _base[fc.VENDOR_OVERRIDE_OFF + 8],
        "写入严格 8B, 0x15C 未被覆盖")
+
+    # 10. 菜单3 保持当前设备 MN/SN (客户参数区不参与校验)
+    _bridge = BRIDGE_FILES["blk1"].read_bytes()
+    _gd_hdr = BASE_FILES["gd"].read_bytes()[:fc.HEADER_SIZE]
+    _bd, _bi = preserve_identity(_bridge, _gd_hdr, None)
+    _bimg = fc.FwImage(_bd, "<bridge>")
+    ck(_bi["sn"] == "NA6169D003A74" and _bi["mn"] == "E2M2 64GB"
+       and not _bi["dynamic"], "菜单3 保持静态 MN/SN (来源 1KB 头)")
+    ck(not _bimg.errors()
+       and _bimg.checksum == fc.FwImage(_bridge, "b").checksum
+       and _bimg.serial == "NA6169D003A74" and _bimg.model == "E2M2 64GB",
+       "菜单3 MN/SN 回写后校验/长度不变")
+    _xm_hdr = BASE_FILES["xm"].read_bytes()[:fc.HEADER_SIZE]
+    _bd2, _bi2 = preserve_identity(_bridge, _xm_hdr, None)
+    ck(_bi2["dynamic"]
+       and _bd2[fc.MODEL_OFF:fc.MODEL_OFF + fc.MODEL_LEN] == b"\x00" * fc.MODEL_LEN
+       and _bd2[fc.MASK_OFF:fc.VENDOR_OVERRIDE_OFF + fc.VENDOR_OVERRIDE_LEN]
+       == _xm_hdr[fc.MASK_OFF:fc.VENDOR_OVERRIDE_OFF + fc.VENDOR_OVERRIDE_LEN],
+       "菜单3 保持动态拼装 mask/OEM/0x154")
+    _idn = bytearray(4096)
+    _idn[4:24] = b"SN-FALLBACK".ljust(20)
+    _idn[24:64] = b"MN-FALLBACK".ljust(40)
+    _bd3, _bi3 = preserve_identity(BRIDGE_FILES["blk3"].read_bytes(), None, bytes(_idn))
+    ck(_bi3["sn"] == "SN-FALLBACK" and _bi3["mn"] == "MN-FALLBACK"
+       and not fc.FwImage(_bd3, "<b3>").errors(),
+       "菜单3 无 1KB 头时回退 Identify SN/MN")
+    _n = _safe_backup_base("../../客户 A")
+    ck(bool(_n) and "/" not in _n and "\\" not in _n and not _n.startswith("."),
+       "备份自定义名清洗路径分隔符")
+    ck(_safe_backup_base("MyBackup.bin") == "MyBackup",
+       "备份自定义名去掉 .bin 后缀")
 
     print("\n=== 结果: %d 项失败 ===" % len(failures))
     for f in failures:
