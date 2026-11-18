@@ -11,10 +11,12 @@
     python flashtool.py --selftest      # 离线自检 (不接触设备, 可在任意平台跑)
     python flashtool.py --enumerate     # 只看设备枚举结果
 
-【验证边界】wintransport.py 的 DeviceIoControl 调用无法在 Linux 开发机验证;
-本版已在 Linux 上验证: 全部纯逻辑 (镜像/拼装/解码/自检)、Windows 结构体 sizeof、
-IOCTL 常量、协议字节构造。设备 I/O 必须在 Windows 实机先用菜单 1 (只读探测)
-确认 Identify + 厂商日志 0xC0 可读, 再考虑刷写。切勿把设备层当作已验证可用。
+【验证边界】wintransport.py 的 NVMe 直连通道已在 BH799 实机 (Win10 19045 /
+StorNVMe) 验证: 读走 IOCTL_STORAGE_QUERY_PROPERTY (Identify / 0x02 / 0x03 / 0xC0),
+写走 IOCTL_STORAGE_FIRMWARE_DOWNLOAD / ACTIVATE. 不能用
+IOCTL_STORAGE_PROTOCOL_COMMAND: StorNVMe 只放行厂商 opcode, 标准 admin opcode
+(0x06/0x02/0x10/0x11) 会返回 STOR_STATUS_INVALID_PARAMETER (0xC1000006).
+刷写前仍建议先用菜单 1 确认 Identify + 0xC0 可读.
 
 与 Linux 版 (../BH799_E2M2_FlashTool/) 的差异只有设备枚举/传输/权限判断;
 6 项菜单、拼装规则、备份头、规则文本、自检逻辑均逐字复用。
@@ -333,7 +335,9 @@ def confirm_passthrough(state: AppState):
     state.header_1kb = snap["header"]
     state.header_raw = snap["header_raw"]
     state.header_mode = snap["header_mode"]
-    state.probe_ok = bool(snap["identify"])
+    _id = snap["identify"]
+    state.probe_ok = bool(_id) and bool(
+        _id[4:24].strip(b"\x00 ") or _id[24:64].strip(b"\x00 "))
 
 
 # --------------------------------------------------------------------------
@@ -545,10 +549,22 @@ def flash_bytes(state: AppState, data: bytes, label: str = "固件") -> bool:
     _require_device(state)
     img = fc.FwImage(data, "<to flash>")
     img.validate()
+    if state.transport == "nvme":
+        # Windows 官方固件 IOCTL 要求每次下载 4096 对齐; 末尾短块不稳定.
+        # 补 0x00 到 4K 并同步改 DWORD0 长度/奇偶 (补的是 .bss 区, 启动即清零).
+        padded = wt.prepare_image_for_nvme(data)
+        if len(padded) != len(data):
+            print("  直连 NVMe: 镜像 %d -> %d B (末尾补 0x00 至 4096 对齐)"
+                  % (len(data), len(padded)))
+            data = padded
+            img = fc.FwImage(data, "<to flash>")
+            img.validate()
     print("\n待刷镜像: %s (%d B, sha256 %s)"
           % (label, len(data), fc._sha256(data)[:16]))
     print(RULE_SAFETY)
     print("  刷入 slot 3 (SPI Flash), action 1; 完成后请断电重启, 不要热插.")
+    if state.transport == "nvme":
+        print("  Windows 直连: ACTIVATE slot 0; 固件按镜像头 DWORD32 的 slot=3 写 SPI.")
     if not confirm("确认把 %s 刷入 %s?" % (label, state.disk.path), "Y"):
         print("已取消.")
         return False
@@ -558,7 +574,10 @@ def flash_bytes(state: AppState, data: bytes, label: str = "固件") -> bool:
     with _open_dev(state) as dev:
         fc.flash_image(dev, img, chunk=fc.CHUNK_MAX, slot=fc.SLOT_SPI,
                        action=1, progress=True)
-    print("刷写命令已下发完成. 请断开连接10s后再插入")
+    if state.transport == "nvme":
+        print("刷写命令已下发完成. 请断电 10 秒后再上电 (不要热插拔).")
+    else:
+        print("刷写命令已下发完成. 请断开连接10s后再插入")
     return True
 
 
@@ -1090,12 +1109,19 @@ def selftest() -> int:
     ck(L["SCSI_PASS_THROUGH_DIRECT"] == 56, "SCSI_PASS_THROUGH_DIRECT sizeof=56")
     ck(L["SCSI_PASS_THROUGH_DIRECT.Cdb"] == 36, "SCSI_PASS_THROUGH_DIRECT.Cdb 偏移=36")
     ck(L["SRB_IO_CONTROL"] == 28, "SRB_IO_CONTROL sizeof=28")
-    ck(L["SPC_HEADER_LEN"] == 80 and L["SPC_DATA_OFFSET"] == 144,
-       "STORAGE_PROTOCOL_COMMAND 头/数据偏移 80/144")
+    ck(L["SPD_OFFSET"] == 8 and L["SPD_LEN"] == 40,
+       "STORAGE_PROTOCOL_SPECIFIC_DATA @8 len=40")
+    ck(L["FW_DOWNLOAD_HDR_LEN"] == 32 and L["FW_ACTIVATE_HDR_LEN"] == 16,
+       "固件 IOCTL 结构头 32/16")
+    ck(wt.FW_DOWNLOAD_VERSION == 0x28, "FW Download Version=0x28 (classpnp 最小)")
     ck(wt.IOCTL_STORAGE_QUERY_PROPERTY == 0x002D1400,
        "IOCTL_STORAGE_QUERY_PROPERTY=0x2D1400")
     ck(wt.IOCTL_STORAGE_PROTOCOL_COMMAND == 0x002DD3C0,
        "IOCTL_STORAGE_PROTOCOL_COMMAND=0x2DD3C0")
+    ck(wt.IOCTL_STORAGE_FIRMWARE_DOWNLOAD == 0x002DDC04,
+       "IOCTL_STORAGE_FIRMWARE_DOWNLOAD=0x2DDC04")
+    ck(wt.IOCTL_STORAGE_FIRMWARE_ACTIVATE == 0x002DDC08,
+       "IOCTL_STORAGE_FIRMWARE_ACTIVATE=0x2DDC08")
     ck(wt.IOCTL_SCSI_PASS_THROUGH_DIRECT == 0x0004D014,
        "IOCTL_SCSI_PASS_THROUGH_DIRECT=0x4D014")
     ck(wt.IOCTL_SCSI_MINIPORT == 0x0004D008, "IOCTL_SCSI_MINIPORT=0x4D008")
@@ -1162,14 +1188,27 @@ def selftest() -> int:
     ck(nb[:4] == b"NVME" and struct.unpack_from("<I", nb, 8)[0] == 0x06
        and struct.unpack_from("<I", nb, 48)[0] == 1,
        "JMS583 NVM 命令块: 签名/opcode/CDW10")
-    nc = wt._nvme_command(0x02, 0, 0x00FF00C0, 0, 0, 0, 0, 0)
-    ck(nc[0] == 0x02 and struct.unpack_from("<I", nc, 40)[0] == 0x00FF00C0,
-       "NVMe 64B 命令 CDW0/CDW10")
-    spc = wt._spc_buffer(0x02, 0, (0, 0, 0, 0, 0, 0), data_in=1024)
-    ck(len(spc) == wt.SPC_DATA_OFFSET + 1024
-       and spc[wt.SPC_HEADER_LEN] == 0x02
-       and struct.unpack_from("<I", spc, 36)[0] == 1024,
-       "STORAGE_PROTOCOL_COMMAND 缓冲构造 (Command@80, Data@144)")
+    q = wt._protocol_query_buffer(wt.NVME_DATA_TYPE_LOG_PAGE, 0xC0, 0, 1024)
+    ck(len(q) == 8 + 40 + 1024
+       and struct.unpack_from("<II", q, 0) == (49, 0)
+       and struct.unpack_from("<I", q, 8)[0] == wt.PROTOCOL_TYPE_NVME
+       and struct.unpack_from("<I", q, 16)[0] == 0xC0
+       and struct.unpack_from("<I", q, 24)[0] == 40
+       and struct.unpack_from("<I", q, 28)[0] == 1024,
+       "QUERY_PROPERTY 缓冲构造 (SPD@8, LID/长度)")
+    db = wt._fw_download_buffer(0x1000, b"\xA5" * 800,
+                                wt.FW_DOWNLOAD_FLAG_CONTROLLER
+                                | wt.FW_DOWNLOAD_FLAG_FIRST_SEGMENT
+                                | wt.FW_DOWNLOAD_FLAG_LAST_SEGMENT)
+    ck(len(db) == 32 + 800
+       and struct.unpack_from("<III", db, 0) == (0x28, 832, 0x7)
+       and struct.unpack_from("<QQ", db, 16) == (0x1000, 800)
+       and db[32:] == b"\xA5" * 800,
+       "FW Download 缓冲 (Version40/Size/Flags/Offset/BufferSize)")
+    ab = wt._fw_activate_buffer()
+    ck(len(ab) == 16 and struct.unpack_from("<II", ab, 0) == (16, 16)
+       and ab[8] == wt.FW_DOWNLOAD_FLAG_CONTROLLER and ab[12] == 0,
+       "FW Activate 缓冲 (Version16/Size16/Flags=CONTROLLER/Slot0)")
     if not wt.IS_WINDOWS:
         try:
             wt.list_disks()

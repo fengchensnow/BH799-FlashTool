@@ -92,7 +92,19 @@ python flashtool.py --enumerate
 python flashtool.py --selftest
 ```
 
-> Windows 设备层（`DeviceIoControl`）建议在实机先用菜单 1 确认 Identify 与厂商日志 `0xC0` 能读回有效 1KB 头，再考虑刷写。程序把「只读探测成功」设为刷写的硬前置。
+> Windows 直连 NVMe 使用两条官方通路：读（Identify / Get Log，含厂商 `0xC0`）走
+> `IOCTL_STORAGE_QUERY_PROPERTY`，写（FW Download / Commit）走
+> `IOCTL_STORAGE_FIRMWARE_DOWNLOAD` / `IOCTL_STORAGE_FIRMWARE_ACTIVATE`。
+> StorNVMe 只允许厂商自定义 opcode 通过 `IOCTL_STORAGE_PROTOCOL_COMMAND`，标准
+> admin 命令会被拒绝（`STOR_STATUS_INVALID_PARAMETER`），本版不使用该路径。
+> 固件下载的 `Version` 必须是 `0x28`，且 DOWNLOAD/ACTIVATE 都要带
+> `STORAGE_HW_FIRMWARE_REQUEST_FLAG_CONTROLLER`；ACTIVATE 不带该标志会走 classpnp
+> 的 SRB 路径，实测返回 1117 且 SPI 不写入。
+> 直连 NVMe 刷写时，镜像会在末尾补 `0x00` 到 4096 边界（Windows 官方固件 IOCTL
+> 的对齐要求；补的是 `.bss` 区，启动时本来就要清零），DWORD0 长度/奇偶同步更新。
+> 该链路已在 Win10 19045 + BH799 实机验证：刷写后 `0xC0` 头 DWORD0 变为补齐后的
+> 长度，SN/型号/UART/厂商覆盖串等客户参数保持不变。ACTIVATE 若仍返回 `1117`，
+> **不要重试**；断电 10 秒后上电，再用菜单 1 检查 `0xC0` 头。
 
 启动后：列出磁盘 → 选择目标 → 按传输类型决策 → 只读探测 → **自动列出设备信息** → 进入菜单。主界面按 `r` 重选设备、`0` 退出，选选项后自动清屏，任意处 Ctrl-C 优雅退出。
 
@@ -101,7 +113,7 @@ python flashtool.py --selftest
 | 传输类型 | Linux (`TRAN`) | Windows (`BusType`) | 通道 |
 |---|---|---|---|
 | USB 硬盘盒 | `usb` | `Usb` | JMicron SCSI / SG_IO 透传 |
-| 直连 NVMe | `nvme` | `Nvme` | NVMe Admin 直通 |
+| 直连 NVMe | `nvme` | `Nvme` | 读 `QUERY_PROPERTY` / 写 `FIRMWARE_*` |
 | 其它 / 未知 | `sata` 等 | `Sata` 等 | 拒绝 |
 
 Linux 版另显示 VID:PID 与驱动（`152d:f583/uas`）；Windows 纯 `DeviceIoControl` 取不到 USB VID/PID，用 `BusType=Usb` 判定硬盘盒。
@@ -180,5 +192,7 @@ python -m nuitka --standalone "--include-data-files=FIRMWARE/*=FIRMWARE/" `
 
 - 本工具不现场生成固件补丁；`FIRMWARE/*.bin` 仅作数据文件，改动前请自行核对 SHA-256。
 - 刷写中途失败 / 掉电会变砖，只能用 SPI 编程器恢复；刷前先备份设备信息。
-- Windows 设备层来自静态移植与协议字节级比对，实机请以只读探测确认后再刷写。
+- Windows NVMe 直连通道已在 BH799 实机验证；直连刷写会自动做 4K 末尾补齐（见上文）。
+- Windows JMS583 通道与 Linux 版一致：FW Download 的 SCSI 数据段按 512B 补齐，
+  NUMD 仍按原始长度，末尾 800B 块可正常下发。
 

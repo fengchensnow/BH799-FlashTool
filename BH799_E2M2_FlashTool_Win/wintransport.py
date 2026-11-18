@@ -22,7 +22,16 @@
       IOCTL_SCSI_PASS_THROUGH_DIRECT + 3 步 ATA-PASS-THROUGH(12) 0xA1,
       与 Linux SG_IO 路径逐字节同构 (CDB/NVM 命令块/回复解析完全相同)。
   * 直连 NVMe (BusType=Nvme): WinNvmeAdmin
-      IOCTL_STORAGE_PROTOCOL_COMMAND + STORAGE_PROTOCOL_COMMAND(Win10+)。
+      读 (Identify / Get Log, 含厂商 0xC0):
+        IOCTL_STORAGE_QUERY_PROPERTY + STORAGE_PROTOCOL_SPECIFIC_DATA
+      写 (FW Download / Commit):
+        IOCTL_STORAGE_FIRMWARE_DOWNLOAD / IOCTL_STORAGE_FIRMWARE_ACTIVATE
+
+【为什么不用 IOCTL_STORAGE_PROTOCOL_COMMAND】
+  StorNVMe 只允许厂商自定义 opcode 透传; 标准 admin 命令 (Identify 0x06 /
+  Get Log 0x02 / FW Download 0x11 / Commit 0x10) 会被 StorNVMe 以
+  STOR_STATUS_INVALID_PARAMETER (0xC1000006) 拒绝。实测本机 (Win10 19045,
+  stornvme) 厂商 opcode 能透传, 标准 opcode 全部被拒, 故改用上面两条官方通路。
 
 对外接口与 Linux 版传输层完全一致 (flashcore 的 flash_image / probe_device /
 read_header_1kb 无需改动即可复用):
@@ -74,6 +83,14 @@ IOCTL_STORAGE_QUERY_PROPERTY = CTL_CODE(
 IOCTL_STORAGE_PROTOCOL_COMMAND = CTL_CODE(
     FILE_DEVICE_MASS_STORAGE, 0x04F0, METHOD_BUFFERED,
     FILE_READ_ACCESS | FILE_WRITE_ACCESS)                                     # 0x002DD3C0
+IOCTL_STORAGE_FIRMWARE_GET_INFO = CTL_CODE(
+    FILE_DEVICE_MASS_STORAGE, 0x0700, METHOD_BUFFERED, FILE_ANY_ACCESS)       # 0x002D1C00
+IOCTL_STORAGE_FIRMWARE_DOWNLOAD = CTL_CODE(
+    FILE_DEVICE_MASS_STORAGE, 0x0701, METHOD_BUFFERED,
+    FILE_READ_ACCESS | FILE_WRITE_ACCESS)                                     # 0x002DDC04
+IOCTL_STORAGE_FIRMWARE_ACTIVATE = CTL_CODE(
+    FILE_DEVICE_MASS_STORAGE, 0x0702, METHOD_BUFFERED,
+    FILE_READ_ACCESS | FILE_WRITE_ACCESS)                                     # 0x002DDC08
 IOCTL_SCSI_PASS_THROUGH_DIRECT = CTL_CODE(
     FILE_DEVICE_CONTROLLER, 0x0405, METHOD_BUFFERED,
     FILE_READ_ACCESS | FILE_WRITE_ACCESS)                                     # 0x0004D014
@@ -102,27 +119,31 @@ BUS_TYPE = {
 BUS_TYPE_USB = 7
 BUS_TYPE_NVME = 17
 
+# STORAGE_PROPERTY_QUERY / STORAGE_PROTOCOL_SPECIFIC_DATA
+STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY = 49   # StorageAdapterProtocolSpecificProperty
+STORAGE_PROPERTY_STANDARD_QUERY = 0               # PropertyStandardQuery
+PROTOCOL_TYPE_NVME = 3                            # ProtocolTypeNvme
+NVME_DATA_TYPE_IDENTIFY = 1                       # NVMeDataTypeIdentify
+NVME_DATA_TYPE_LOG_PAGE = 2                       # NVMeDataTypeLogPage
+# 微软示例把 STORAGE_PROTOCOL_SPECIFIC_DATA 放在 AdditionalParameters (偏移 8),
+# 不是 sizeof(STORAGE_PROPERTY_QUERY)=12; 实测偏移 8 可用, 12 报 ERROR_INVALID_PARAMETER.
+SPD_OFFSET = 8
+SPD_LEN = 40
+
+# STORAGE_HW_FIRMWARE_DOWNLOAD / ACTIVATE
+# Version 不是 sizeof: classpnp 要求 >= 0x28(40); 结构头仍是 32B, 镜像紧跟其后.
+FW_DOWNLOAD_VERSION = 0x28
+FW_DOWNLOAD_HDR_LEN = 32
+FW_DOWNLOAD_FLAG_CONTROLLER = 0x1       # 目标为控制器; 同时使 classpnp 对齐要求降为 1
+FW_DOWNLOAD_FLAG_LAST_SEGMENT = 0x2
+FW_DOWNLOAD_FLAG_FIRST_SEGMENT = 0x4
+FW_ACTIVATE_HDR_LEN = 16
+FW_DOWNLOAD_SECTOR = 512                # 末尾短块按 512 补齐由传输层处理
+
 # SCSI_PASS_THROUGH_DIRECT.DataIn
 SCSI_IOCTL_DATA_OUT = 0
 SCSI_IOCTL_DATA_IN = 1
 SCSI_IOCTL_DATA_UNSPECIFIED = 2
-
-# STORAGE_PROTOCOL_COMMAND / NVMe
-STORAGE_PROTOCOL_STRUCTURE_VERSION = 0x1
-PROTOCOL_TYPE_NVME = 3
-STORAGE_PROTOCOL_COMMAND_FLAG_ADAPTER_REQUEST = 0x80000000
-STORAGE_PROTOCOL_STATUS = {
-    0: "PENDING", 1: "SUCCESS", 2: "ERROR", 3: "INVALID_REQUEST",
-    4: "NO_DEVICE", 5: "BUSY", 6: "DATA_OVERRUN",
-    7: "INSUFFICIENT_RESOURCES", 8: "NOT_SUPPORTED",
-}
-# 【待实机确认】winioctl.h(用户态, 本工具用) 的 STORAGE_PROTOCOL_COMMAND 是
-# Reserved1[2] -> 20 个 DWORD = 80B, Command[] 从 80 起; 而 ntddstor.h(内核态)
-# 是 Reserved1[1] -> 76B。若直连 NVMe 通道 ReturnStatus 异常, 第一处要核对的就是
-# SPC_HEADER_LEN(76/80) 与 Length 字段(微软文档写 sizeof(结构), 也有实现填 80)。
-SPC_HEADER_LEN = 80
-NVME_COMMAND_LEN = 64      # CDW0..CDW15
-SPC_DATA_OFFSET = 144      # 80 + 64, 8 字节对齐 (指针要求)
 
 SENSE_LEN = 32
 
@@ -179,8 +200,10 @@ def describe_layout():
         "SCSI_PASS_THROUGH_DIRECT": ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT),
         "SCSI_PASS_THROUGH_DIRECT.Cdb": SCSI_PASS_THROUGH_DIRECT.Cdb.offset,
         "SRB_IO_CONTROL": ctypes.sizeof(SRB_IO_CONTROL),
-        "SPC_HEADER_LEN": SPC_HEADER_LEN,
-        "SPC_DATA_OFFSET": SPC_DATA_OFFSET,
+        "SPD_OFFSET": SPD_OFFSET,
+        "SPD_LEN": SPD_LEN,
+        "FW_DOWNLOAD_HDR_LEN": FW_DOWNLOAD_HDR_LEN,
+        "FW_ACTIVATE_HDR_LEN": FW_ACTIVATE_HDR_LEN,
         "DISK_GEOMETRY_LEN": DISK_GEOMETRY_LEN,
     }
 
@@ -258,17 +281,21 @@ def _ioctl(h, code: int, in_bytes: bytes, out_len: int) -> bytes:
     """DeviceIoControl(METHOD_BUFFERED), 独立 in/out 缓冲区, 返回 out_len 字节."""
     ib = (ctypes.c_ubyte * max(len(in_bytes), 1)).from_buffer_copy(
         in_bytes if in_bytes else b"\x00")
-    ob = (ctypes.c_ubyte * max(out_len, 1))()
+    if out_len:
+        ob = (ctypes.c_ubyte * out_len)()
+        ob_ptr = ctypes.cast(ob, ctypes.c_void_p)
+    else:
+        ob, ob_ptr = None, None
     returned = ctypes.c_uint32(0)
     ok = _k32.DeviceIoControl(
         h, code,
         ctypes.cast(ib, ctypes.c_void_p), len(in_bytes),
-        ctypes.cast(ob, ctypes.c_void_p), out_len,
+        ob_ptr, out_len,
         ctypes.byref(returned), None)
     if not ok:
         raise fc.NvmeError("DeviceIoControl 0x%08X 失败 (GetLastError=%d)"
                            % (code, ctypes.get_last_error()))
-    return bytes(bytearray(ob))[:out_len]
+    return bytes(bytearray(ob))[:out_len] if ob is not None else b""
 
 
 # --------------------------------------------------------------------------
@@ -513,8 +540,13 @@ class WinJmicronScsi:
     def fw_download(self, byte_offset: int, chunk: bytes):
         if byte_offset % 4 or len(chunk) % 4:
             raise ValueError("FW Download 的 offset/length 必须是 4 字节对齐")
+        # 与 Linux 版一致: SCSI 数据段按 512B 补齐, 但 NUMD 仍按原始 chunk 长度.
+        # 末尾 800B 块不补齐时 JMS583 会拒绝 data-out.
+        xfer = chunk
+        if len(xfer) % FW_DOWNLOAD_SECTOR:
+            xfer += b"\xFF" * (FW_DOWNLOAD_SECTOR - len(xfer) % FW_DOWNLOAD_SECTOR)
         self._admin(fc.ADMIN_FW_DOWNLOAD, cdw10=(len(chunk) >> 2) - 1,
-                    cdw11=byte_offset >> 2, data_out=chunk, timeout_ms=60000)
+                    cdw11=byte_offset >> 2, data_out=xfer, timeout_ms=60000)
 
     def fw_commit(self, slot: int, action: int):
         self._admin(fc.ADMIN_FW_COMMIT,
@@ -529,54 +561,83 @@ class WinJmicronScsi:
 
 
 # --------------------------------------------------------------------------
-# 直连 NVMe: IOCTL_STORAGE_PROTOCOL_COMMAND (Win10+, in-box stornvme.sys)
+# 直连 NVMe: 读走 QUERY_PROPERTY, 写走 STORAGE_FIRMWARE_* (Win10+, stornvme.sys)
 # --------------------------------------------------------------------------
 
 
-def _nvme_command(opcode, nsid, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15):
-    """64B NVMe 命令: CDW0[7:0]=opcode, NSID@4, CDW10..15@40..63."""
-    c = bytearray(NVME_COMMAND_LEN)
-    struct.pack_into("<I", c, 0, opcode & 0xFF)      # CID=0, FUSE=0
-    struct.pack_into("<I", c, 4, nsid & 0xFFFFFFFF)
-    for i, v in enumerate((cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)):
-        struct.pack_into("<I", c, 40 + 4 * i, v & 0xFFFFFFFF)
-    return bytes(c)
+def _protocol_query_buffer(data_type, request_value, request_sub_value, data_len):
+    """IOCTL_STORAGE_QUERY_PROPERTY 输入: STORAGE_PROPERTY_QUERY + SPD + 数据区.
 
-
-def _spc_buffer(opcode, nsid, cdw, data_in=None, data_out=None, timeout_ms=30000):
-    """构造 STORAGE_PROTOCOL_COMMAND + 64B Command + 数据缓冲区."""
-    data_len = len(data_out) if data_out is not None else (data_in or 0)
-    total = SPC_DATA_OFFSET + data_len
+    SPD 放在 AdditionalParameters (偏移 8); ProtocolDataOffset 相对 SPD 起点.
+    """
+    total = SPD_OFFSET + SPD_LEN + data_len
     b = bytearray(total)
-    struct.pack_into("<I", b, 0, STORAGE_PROTOCOL_STRUCTURE_VERSION)  # Version
-    struct.pack_into("<I", b, 4, SPC_HEADER_LEN)                       # Length
-    struct.pack_into("<I", b, 8, PROTOCOL_TYPE_NVME)                    # ProtocolType
-    struct.pack_into("<I", b, 12, 0)                                    # Flags (设备级)
-    # 16 ReturnStatus / 20 ErrorCode: 输出, 置 0
-    struct.pack_into("<I", b, 24, NVME_COMMAND_LEN)                     # CommandLength
-    struct.pack_into("<I", b, 28, 0)                                    # ErrorInfoLength
-    struct.pack_into("<I", b, 40, max(1, timeout_ms // 1000))          # TimeOutValue(秒)
-    struct.pack_into("<I", b, 44, 0)                                    # ErrorInfoOffset
-    if data_out is not None:
-        struct.pack_into("<I", b, 32, len(data_out))                    # DataToDeviceTransferLength
-        struct.pack_into("<I", b, 48, SPC_DATA_OFFSET)                  # DataToDeviceBufferOffset
-        b[SPC_DATA_OFFSET:SPC_DATA_OFFSET + len(data_out)] = data_out
-    elif data_in:
-        struct.pack_into("<I", b, 36, data_in)                          # DataFromDeviceTransferLength
-        struct.pack_into("<I", b, 52, SPC_DATA_OFFSET)                  # DataFromDeviceBufferOffset
-    b[SPC_HEADER_LEN:SPC_HEADER_LEN + NVME_COMMAND_LEN] = _nvme_command(
-        opcode, nsid, *cdw)
+    struct.pack_into("<II", b, 0, STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY,
+                     STORAGE_PROPERTY_STANDARD_QUERY)
+    struct.pack_into("<IIIIII", b, SPD_OFFSET, PROTOCOL_TYPE_NVME, data_type,
+                     request_value, request_sub_value, SPD_LEN, data_len)
     return bytes(b)
 
 
+def _fw_download_buffer(byte_offset, chunk,
+                        flags=FW_DOWNLOAD_FLAG_CONTROLLER):
+    """STORAGE_HW_FIRMWARE_DOWNLOAD: Version=0x28, ImageBuffer 紧跟 32B 头."""
+    b = bytearray(FW_DOWNLOAD_HDR_LEN + len(chunk))
+    struct.pack_into("<III", b, 0, FW_DOWNLOAD_VERSION,
+                     FW_DOWNLOAD_HDR_LEN + len(chunk), flags)
+    b[12] = 0                                    # Slot: Windows 只暴露 0
+    struct.pack_into("<QQ", b, 16, byte_offset, len(chunk))
+    b[FW_DOWNLOAD_HDR_LEN:] = chunk
+    return bytes(b)
+
+
+def _fw_activate_buffer():
+    """STORAGE_HW_FIRMWARE_ACTIVATE: Version=16, Size=16, Flags=CONTROLLER, Slot=0.
+
+    Flags 必须带 CONTROLLER: classpnp 对带该标志的请求走 IofCallDriver 转发给
+    StorNVMe; 不带则构造 SRB (0xF3B) 走 classpnp 自己的路径, NVMe 下实测
+    ACTIVATE 返回 1117 且 SPI 未被写入.
+    """
+    return struct.pack("<IIIB3s", FW_ACTIVATE_HDR_LEN, FW_ACTIVATE_HDR_LEN,
+                       FW_DOWNLOAD_FLAG_CONTROLLER, 0, b"\x00\x00\x00")
+
+
+def prepare_image_for_nvme(data: bytes) -> bytes:
+    """把镜像补齐到 4096 边界, 供 Windows 官方固件 IOCTL 使用.
+
+    classpnp/StorNVMe 要求每次 FW Download 的 BufferSize 为 4096 的倍数
+    (CONTROLLER 可放宽, 但末尾短块实测不稳定), 而 BH799 固件在 commit 时
+    校验「镜像头 DWORD0 长度 + 0x400 == 下载总长」. 因此末尾补 0x00 到
+    4K 边界并同步改 DWORD0 (长度 + 奇偶).
+
+    补的是 body 末尾, 即固件 RAM 布局里的 .bss 区; 启动时 .bss 本来就要
+    清零, 补 0x00 与启动语义一致; 0x00 对 DWORD31 XOR 无贡献, 校验值不变
+    (仍重算一次以保证自洽).
+    """
+    pad = (-len(data)) % 4096
+    if pad == 0:
+        return data
+    if len(data) < fc.HEADER_SIZE:
+        raise fc.ImageError("镜像小于 1KB, 无法补齐: %d B" % len(data))
+    out = bytearray(data) + b"\x00" * pad
+    body = len(out) - fc.HEADER_SIZE
+    low3 = body.to_bytes(4, "big")[1:]                 # 低 24 位
+    out[0:4] = bytes([low3[0] ^ low3[1] ^ low3[2] ^ 0xFF]) + low3
+    chk = fc.xor_words(bytes(out[fc.HEADER_SIZE:fc.FLASH_SIZE]))
+    out[0x7C:0x80] = chk.to_bytes(4, "big")
+    return bytes(out)
+
+
 class WinNvmeAdmin:
-    """直连 NVMe (M.2/PCIe, BusType=Nvme) 的 admin 命令直通.
+    """直连 NVMe (M.2/PCIe, BusType=Nvme).
 
-    用 IOCTL_STORAGE_PROTOCOL_COMMAND + STORAGE_PROTOCOL_COMMAND(Win10+)。
+    读: IOCTL_STORAGE_QUERY_PROPERTY (StorNVMe 官方查询接口, 支持 Identify/
+        Get Log Page, 含厂商 LID 0xC0; 免管理员也可读).
+    写: IOCTL_STORAGE_FIRMWARE_DOWNLOAD / _ACTIVATE (官方固件升级 IOCTL).
 
-    【未验证 / 已知限制】MS 文档明确: StorNVMe.sys 会拦截 Command Effects Log
-    未登记的命令; 厂商日志 0xC0、FW Download/Commit 能否放行取决于具体驱动/固件。
-    必须在 Windows 实机用只读 Identify/Get Log 确认; 若不通, 请改用 USB 硬盘盒通道。
+    IOCTL_STORAGE_PROTOCOL_COMMAND 只放行厂商自定义 opcode; 标准 admin 命令
+    (0x06/0x02/0x10/0x11) 会被 StorNVMe 以 STOR_STATUS_INVALID_PARAMETER
+    (0xC1000006) 拒绝, 故本通道不使用它.
     """
 
     def __init__(self, path: str):
@@ -598,44 +659,56 @@ class WinNvmeAdmin:
     def __exit__(self, *exc):
         self.close()
 
-    def _admin(self, opcode, cdw10=0, cdw11=0, cdw12=0, cdw13=0, cdw14=0,
-               cdw15=0, nsid=0, data_in=None, data_out=None, timeout_ms=30000):
-        cdw = (cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
-        buf = _spc_buffer(opcode, nsid, cdw, data_in, data_out, timeout_ms)
-        out = _ioctl(self.h, IOCTL_STORAGE_PROTOCOL_COMMAND, buf, len(buf))
-        status = struct.unpack_from("<I", out, 16)[0]   # ReturnStatus
-        if status != 1:  # STORAGE_PROTOCOL_STATUS_SUCCESS
-            err = struct.unpack_from("<I", out, 20)[0]
+    def _query(self, data_type, request_value, request_sub_value, data_len):
+        total = SPD_OFFSET + SPD_LEN + data_len
+        out = _ioctl(self.h, IOCTL_STORAGE_QUERY_PROPERTY,
+                     _protocol_query_buffer(data_type, request_value,
+                                            request_sub_value, data_len),
+                     total)
+        got_off, got_len = struct.unpack_from("<II", out, SPD_OFFSET + 16)
+        start = SPD_OFFSET + got_off
+        payload = out[start:start + min(got_len, data_len)]
+        if len(payload) < data_len:
             raise fc.NvmeError(
-                "NVMe 命令 0x%02X 失败: ReturnStatus=%s(%d) ErrorCode=0x%08X"
-                % (opcode, STORAGE_PROTOCOL_STATUS.get(status, "?"), status, err))
-        if data_in:
-            return 0, out[SPC_DATA_OFFSET:SPC_DATA_OFFSET + data_in]
-        return 0, b""
+                "协议查询返回不足: 需要 %d B, 实得 %d B (off=%d len=%d)"
+                % (data_len, len(payload), got_off, got_len))
+        return payload
 
     def identify(self, cns=1) -> bytes:
-        _, buf = self._admin(fc.ADMIN_IDENTIFY, cdw10=cns,
-                             data_in=4096, timeout_ms=10000)
-        return buf
+        return self._query(NVME_DATA_TYPE_IDENTIFY, cns, 0, 4096)
 
     def get_log(self, lid: int, size: int = fc.HEADER_SIZE, nsid: int = 0) -> bytes:
-        numd = (size >> 2) - 1
-        cdw10 = (lid & 0xFF) | ((numd & 0xFFFF) << 16)
-        cdw11 = (numd >> 16) & 0xFFFF
-        _, buf = self._admin(fc.ADMIN_GET_LOG_PAGE, cdw10=cdw10, cdw11=cdw11,
-                             nsid=nsid, data_in=size, timeout_ms=10000)
-        return buf
+        return self._query(NVME_DATA_TYPE_LOG_PAGE, lid & 0xFF, nsid, size)
 
     def fw_download(self, byte_offset: int, chunk: bytes):
         if byte_offset % 4 or len(chunk) % 4:
             raise ValueError("FW Download 的 offset/length 必须是 4 字节对齐")
-        self._admin(fc.ADMIN_FW_DOWNLOAD, cdw10=(len(chunk) >> 2) - 1,
-                    cdw11=byte_offset >> 2, data_out=chunk, timeout_ms=60000)
+        # 末尾短块 (<4096) 带上 FIRST|LAST: classpnp 默认要求 BufferSize 按
+        # ImagePayloadAlignment(4096) 对齐; CONTROLLER 可放宽, 但设备侧对短块
+        # 仍会报 IO_DEVICE_ERROR, 而 FIRST|LAST 让驱动按单段处理, 实测 800B 可过.
+        flags = FW_DOWNLOAD_FLAG_CONTROLLER
+        if len(chunk) < fc.CHUNK_MAX:
+            flags |= FW_DOWNLOAD_FLAG_FIRST_SEGMENT | FW_DOWNLOAD_FLAG_LAST_SEGMENT
+        _ioctl(self.h, IOCTL_STORAGE_FIRMWARE_DOWNLOAD,
+               _fw_download_buffer(byte_offset, chunk, flags), 0)
 
     def fw_commit(self, slot: int, action: int):
-        self._admin(fc.ADMIN_FW_COMMIT,
-                    cdw10=(slot & 0x7) | ((action & 0x7) << 3),
-                    timeout_ms=180000)
+        if action != 1:
+            raise fc.NvmeError("Windows 官方固件通道只支持 action=1 (替换并激活)")
+        # Windows 只暴露 slot 0 (STORAGE_HW_FIRMWARE_INFO.SlotCount=1).
+        # BH799 固件在 commit slot=0 时使用镜像头 DWORD32 高 4 位的槽位
+        # (本项目镜像为 3=SPI Flash), 不会写错介质.
+        try:
+            _ioctl(self.h, IOCTL_STORAGE_FIRMWARE_ACTIVATE,
+                   _fw_activate_buffer(), 0)
+        except fc.NvmeError as e:
+            # 1MB SPI 擦写约 2~3s, 可能超过 StorNVMe 默认 SRB 超时; 实测
+            # ACTIVATE 返回 1117 后设备仍正常, 且 SPI 可能已写完.
+            if "GetLastError=1117" in str(e):
+                raise fc.NvmeError(
+                    "ACTIVATE 返回 1117 (设备忙/超时). SPI 写入可能已完成; "
+                    "不要重试. 请断电 10 秒后上电, 再用菜单 1 检查 0xC0 头.") from None
+            raise
 
     def reset(self):
         raise fc.NvmeError("Windows 上没有通用的 NVMe 控制器复位接口; 请断电重启")

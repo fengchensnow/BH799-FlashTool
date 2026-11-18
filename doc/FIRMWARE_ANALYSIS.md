@@ -85,6 +85,16 @@ GD 代码少约 17.7 KB，但 .data 多约 15.6 KB、.bss 多约 7.9 KB。段表
 - `FW Download`（opcode `0x11`）：单块 ≤ 4096 B、4 字节对齐，`NUMD`/`off` 以 dword 计；工具发 `trimmed()` = `data[:1024+size]`。
 - `FW Commit`（opcode `0x10`）：`cdw10 = (slot & 7) | ((action & 7) << 3)`，slot 3 = SPI Flash，action 1。
 - 两份镜像 DWORD32 高 4 位 = 3，即都指向 SPI Flash。
+- **Windows 直连 NVMe 的差异**（`BH799_E2M2_FlashTool_Win/wintransport.py`）：
+  - 读走 `IOCTL_STORAGE_QUERY_PROPERTY`（`0xC0` 同样按 32 位字反序返回，工具自动识别）；
+  - 写走 `IOCTL_STORAGE_FIRMWARE_DOWNLOAD` / `ACTIVATE`；`STORAGE_HW_FIRMWARE_DOWNLOAD.Version=0x28`，
+    两个 IOCTL 都带 `STORAGE_HW_FIRMWARE_REQUEST_FLAG_CONTROLLER`；
+  - Windows 要求每次下载 `BufferSize` 为 4096 的倍数，而镜像总长不是 4096 的倍数。
+    工具在刷写前把镜像末尾补 `0x00` 到 4K 边界并同步更新 DWORD0 长度/奇偶；补的是
+    `.bss` 区（启动本来就要清零），DWORD31 不变。commit 时 Windows 只暴露 slot 0，
+    BH799 固件按镜像头 DWORD32 的 slot=3 写 SPI。
+  - 实机（Win10 19045 / StorNVMe）已验证：补齐后 34 块下载 + ACTIVATE 成功，刷后
+    `0xC0` 头 DWORD0 变为补齐后的长度，客户参数保持不变。
 
 ## SMART 持久化与 eMMC 版本约束
 
